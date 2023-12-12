@@ -1,232 +1,202 @@
-package main
+package client
 
 import (
-	"fmt"
-	"github.com/dev-shao/iprp/log"
-	"github.com/dev-shao/iprp/message"
-	"github.com/dev-shao/iprp/pipe"
+	"errors"
+	"github.com/shaopson/forwarder/client/proxy"
+	"github.com/shaopson/forwarder/message"
+	"github.com/shaopson/forwarder/pipe/crypto"
+	log "github.com/shaopson/grlog"
 	"io"
 	"net"
 	"sync"
 	"time"
 )
 
+var HeartBeatTimeout = time.Second * 60
+var HeartbeatInterval = time.Second * 30
+
 type Manager struct {
-	Client            *Client
-	ClientId          string
-	proxyConfigs      map[string]*ProxyConfig
-	conn              net.Conn
-	pipeConnPool      chan net.Conn
-	agents            map[string]*Agent
-	recvChan          chan message.Message
-	sendChan          chan message.Message
-	heartbeatInterval time.Duration
-	lastBeatTime      time.Time
-	closed            bool
-	closedMutex       sync.RWMutex
-	mutex             sync.RWMutex
+	ClientId     string
+	proxyConfigs map[string]*proxy.Config
+	authToken    string
+	conn         net.Conn
+	proxies      map[string]proxy.Proxy
+	mutex        sync.RWMutex
+	readChan     chan message.Message
+	heartbeat    <-chan time.Time
+	lastBeat     time.Time
 }
 
-func NewManager(conn net.Conn, client *Client, cfgs map[string]*ProxyConfig) *Manager {
-	manager := &Manager{
-		Client:            client,
-		ClientId:          client.ClientId,
-		conn:              conn,
-		proxyConfigs:      make(map[string]*ProxyConfig),
-		agents:            make(map[string]*Agent),
-		recvChan:          make(chan message.Message, 10),
-		sendChan:          make(chan message.Message, 10),
-		heartbeatInterval: time.Second * 20,
+func NewManager(clientId string, conn net.Conn, config *Config) *Manager {
+	return &Manager{
+		ClientId:     clientId,
+		proxyConfigs: config.Proxies,
+		authToken:    config.AuthToken,
+		conn:         conn,
+		proxies:      make(map[string]proxy.Proxy),
+		readChan:     make(chan message.Message, 2),
 	}
-	for name, proxy := range cfgs {
-		manager.proxyConfigs[name] = proxy
-	}
-	return manager
 }
 
 func (self *Manager) Run() {
-	defer self.Close()
-	go self.awaitReceive()
-	go self.awaitSend()
+	log.Info("manager start")
 
-	for _, cfg := range self.proxyConfigs {
-		err := self.RegisterProxy(cfg)
-		if err != nil {
-			log.Warn("register proxy error:%s", err)
-		}
-	}
+	go self.awaitRead()
+	go self.registerAllProxy(self.proxyConfigs)
 
-	ticker := time.NewTicker(self.heartbeatInterval)
-	self.lastBeatTime = time.Now().Add(self.heartbeatInterval / 2)
+	self.heartbeat = time.Tick(HeartbeatInterval)
+	self.lastBeat = time.Now()
+
 	for {
 		select {
-		case <-ticker.C:
-			if time.Since(self.lastBeatTime) > self.heartbeatInterval {
-				log.Warn("heartbeat timeout")
+		case <-self.heartbeat:
+			if time.Since(self.lastBeat) > HeartBeatTimeout {
+				log.Error("heartbeat timeout")
 				return
 			}
-			req := &message.HeartbeatRequest{
+			ping := &message.Ping{
 				ClientId:  self.ClientId,
 				Timestamp: time.Now().Unix(),
 			}
-			self.sendChan <- req
-			log.Debug("send heartbeat")
-		case msg, ok := <-self.recvChan:
+			message.Send(ping, self.conn)
+			log.Debug("send ping")
+		case msg, ok := <-self.readChan:
 			if !ok {
-				log.Debug("receiver channel closed")
+				log.Error("read chan closed")
 				return
 			}
-
-			switch v := msg.(type) {
-			case *message.PipeMessage:
-				conn, err := self.Client.NewPipeConn()
-				if err != nil {
-					log.Warn(" create new pipe connect fail:%s", err)
-				} else {
-					go self.awaitWork(conn)
-				}
-			case *message.ProxyResponse:
-				if v.Result == "ok" {
-					log.Info("register proxy[%s] success", v.ProxyName)
-					self.mutex.RLock()
-					agent, ok := self.agents[v.ProxyName]
-					self.mutex.RUnlock()
-					if ok {
-						agent.Start()
-					} else {
-						log.Warn("agent not found:%s", v.ProxyName)
-					}
-				} else {
-					log.Warn("register proxy[%s] fail:%s", v.ProxyName, v.Result)
-				}
-			case *message.HeartbeatResponse:
-				log.Debug("heartbeat response")
-				self.lastBeatTime = time.Now()
-			default:
-				log.Warn("unknown message")
+			switch msg.(type) {
+			case *message.Pong:
+				self.lastBeat = time.Now()
+				log.Debug("received pong")
 			}
 		}
 	}
-
 }
 
-func (self *Manager) awaitWork(conn net.Conn) {
-	defer conn.Close()
-	msg, err := message.Get(conn)
-	if err != nil {
-		log.Debug("work connect closed")
-		return
+func (self *Manager) registerAllProxy(configs map[string]*proxy.Config) {
+	failures := make(map[string]*proxy.Config)
+	for name, cfg := range self.proxyConfigs {
+		time.Sleep(time.Millisecond * 200)
+		if err := self.registerProxy(cfg); err != nil {
+			log.Error("register proxy '%s' failure:%s", name, err)
+			log.Info("proxy %s waiting try again", name)
+			failures[name] = cfg
+		} else {
+			log.Info("register proxy '%s' success", name)
+		}
 	}
-	workMsg, ok := msg.(*message.WorkMessage)
-	if !ok {
-		return
+	time.Sleep(time.Second)
+	for name, cfg := range failures {
+		time.Sleep(time.Millisecond * 200)
+		if err := self.registerProxy(cfg); err != nil {
+			log.Error("again to register proxy '%s' failure:%s", name, err)
+		} else {
+			log.Info("register proxy '%s' success")
+		}
 	}
-	log.Info("new work:%s", workMsg)
-	//find proxy
-	self.mutex.RLock()
-	agent, ok := self.agents[workMsg.ProxyName]
-	self.mutex.RUnlock()
-	if !ok {
-		log.Warn("[agent not found:%s", workMsg.ProxyName)
-		return
-	}
-	if !agent.Started {
-		log.Warn("agent not started:%s", agent.Name)
-		return
-	}
-	dstConn, err := agent.Connect()
-	if err != nil {
-		log.Warn("agent connect target service fail:%s", err)
-		return
-	}
-	pipe.Join(conn, dstConn)
-
 }
 
-func (self *Manager) RegisterProxy(cfg *ProxyConfig) error {
-	agent, err := NewAgent(cfg)
+func (self *Manager) registerProxy(cfg *proxy.Config) error {
+	addr := self.conn.RemoteAddr().String()
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		log.Warn("create new proxy agent error:%s", err)
 		return err
 	}
+	conn, err = crypto.NewConn(conn, self.authToken)
+	if err != nil {
+		return err
+	}
+
 	req := &message.ProxyRequest{
-		ProxyName: agent.Name,
-		ProxyType: agent.Type,
-		ProxyPort: agent.RemotePort,
-		Enable:    true,
+		ClientId:   self.ClientId,
+		ProxyName:  cfg.Name,
+		ProxyType:  cfg.ProxyType,
+		ProxyIp:    cfg.RemoteIp,
+		ProxyPort:  cfg.RemotePort,
+		RemoteIp:   cfg.LocalIp,
+		RemotePort: cfg.LocalPort,
 	}
-	err = message.Send(req, self.conn)
+	message.Send(req, conn)
+
+	conn.SetReadDeadline(time.Now().Add(MessageReadTimeout))
+	msg, err := message.Read(conn)
 	if err != nil {
 		return err
 	}
-	//
+	conn.SetReadDeadline(time.Time{})
+
+	if resp, ok := msg.(*message.ProxyResponse); !ok {
+		return errors.New("invalid proxy response")
+	} else if resp.Result != "ok" {
+		return errors.New(resp.Result)
+	}
+
+	//new proxy
+	var pry proxy.Proxy
+	switch cfg.ProxyType {
+	case "tcp":
+		pry, err = proxy.NewTCPProxy(cfg, conn)
+	case "udp":
+		pry, err = proxy.NewUDPProxy(cfg, conn)
+	}
+	if err != nil {
+		return err
+	}
 	self.mutex.Lock()
-	self.agents[agent.Name] = agent
-	self.mutex.Unlock()
-	log.Info("register new proxy:%s", agent.Name)
+	defer self.mutex.Unlock()
+	old, ok := self.proxies[cfg.Name]
+	if ok {
+		old.Close()
+		delete(self.proxies, cfg.Name)
+	}
+	self.proxies[cfg.Name] = pry
+
+	go func() {
+		pry.Run()
+		self.closeProxy(cfg.Name)
+	}()
+
 	return nil
 }
 
-func (self *Manager) awaitReceive() {
-	defer func() {
-		if err := recover(); err != nil {
-			log.Error("panic:%s", err)
-		}
-	}()
-	if self.IsClosed() {
-		return
+func (self *Manager) closeProxy(name string) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if p, ok := self.proxies[name]; ok {
+		delete(self.proxies, name)
+		p.Close()
 	}
-	for {
-		if msg, err := message.Get(self.conn); err != nil {
-			if err == io.EOF {
-				log.Debug("manager connect closed")
-			} else {
-				log.Warn("get message error:%s", err)
-			}
-			break
-		} else {
-			if self.IsClosed() {
-				break
-			}
-			self.recvChan <- msg
-		}
-	}
-}
 
-func (self *Manager) awaitSend() {
-	for {
-		msg, ok := <-self.sendChan
-		if !ok { //manager closed
-			break
-		}
-		err := message.Send(msg, self.conn)
-		if err != nil {
-			log.Warn("send message error:%s", err)
-			break
-		}
+	msg := &message.CloseProxy{
+		ClientId:  self.ClientId,
+		ProxyName: name,
 	}
-}
-
-func (self *Manager) IsClosed() bool {
-	self.closedMutex.RLock()
-	defer self.closedMutex.RUnlock()
-	return self.closed
+	message.Send(msg, self.conn)
+	log.Info("manager close proxy '%s'", name)
 }
 
 func (self *Manager) Close() {
-	if self.IsClosed() {
-		return
+	//close proxies
+	for name, _ := range self.proxies {
+		self.closeProxy(name)
 	}
-	self.closedMutex.Lock()
-	self.closed = true
-	self.closedMutex.Unlock()
-	close(self.recvChan)
-	close(self.sendChan)
 	self.conn.Close()
-
-	log.Info("%s close", self)
+	log.Info("manager close")
 }
 
-func (self *Manager) String() string {
-	return fmt.Sprintf("<Manager:%s>", self.ClientId)
+func (self *Manager) awaitRead() {
+	defer close(self.readChan)
+	for {
+		if msg, err := message.Read(self.conn); err != nil {
+			if err == io.EOF {
+				log.Info("server connection closed")
+			} else {
+				log.Error("read message failure from connection %s:%s", self.conn.RemoteAddr(), err)
+			}
+			return
+		} else {
+			self.readChan <- msg
+		}
+	}
 }

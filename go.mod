@@ -1,10 +1,10 @@
-module github.com/dev-shao/iprp
+module github.com/shaopson/forwarder
 
 go 1.19
 
 require (
-	github.com/hashicorp/yamux v0.1.1
-	gopkg.in/ini.v1 v1.67.0
+	github.com/hashicorp/yamux v0.1.1 // indirect
+	github.com/shaopson/grlog v0.1.1 // indirect
+	github.com/spf13/pflag v1.0.5 // indirect
+	gopkg.in/ini.v1 v1.67.0 // indirect
 )
-
-require github.com/stretchr/testify v1.8.2 // indirect

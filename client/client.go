@@ -1,143 +1,102 @@
-package main
+package client
 
 import (
 	"errors"
-	"github.com/dev-shao/iprp/log"
-	"github.com/dev-shao/iprp/message"
-	"github.com/hashicorp/yamux"
-	"io"
+	"github.com/shaopson/forwarder/client/proxy"
+	"github.com/shaopson/forwarder/message"
+	"github.com/shaopson/forwarder/pipe/crypto"
+	log "github.com/shaopson/grlog"
 	"net"
 	"os"
 	"time"
 )
 
-type ClientConfig struct {
-	ServerIp     string `ini:"server_ip"`
-	ServerPort   string `ini:"server_port"`
-	AuthCode     string `ini:"auth_code"`
-	PipeCount    int    `ini:"pipe_count"`
-	LogFile      string `ini:"log_file"`
-	ProxyConfigs map[string]*ProxyConfig
+const MessageReadTimeout = time.Second * 5
+
+type Config struct {
+	ServerIp   string `ini:"server_ip"`
+	ServerPort string `ini:"server_port"`
+	AuthToken  string `ini:"auth_token"`
+	LogFile    string `ini:"log_file"`
+	Proxies    map[string]*proxy.Config
 }
 
 type Client struct {
-	Config     *ClientConfig
-	ClientId   string
-	serverAddr string
-	conn       net.Conn
-	session    *yamux.Session
+	config    *Config
+	authToken string
+	clientId  string
 }
 
-func NewClient(cfg *ClientConfig) *Client {
-	return &Client{
-		Config:     cfg,
-		serverAddr: net.JoinHostPort(cfg.ServerIp, cfg.ServerPort),
+func NewClient(cfg *Config) *Client {
+	client := &Client{
+		config:    cfg,
+		authToken: cfg.AuthToken,
 	}
+	return client
 }
 
 func (self *Client) Run() error {
+	addr := net.JoinHostPort(self.config.ServerIp, self.config.ServerPort)
 	tryCount := 0
-
 	for {
 		tryCount += 1
 		if tryCount > 5 {
-			return errors.New("The number of login failures over the limit")
+			return errors.New("exceeded maximum number of try, exit")
 		}
-		conn, err := self.connectServer()
+		log.Info("connecting to server %s", addr)
+		conn, err := net.DialTimeout("tcp", addr, time.Second*10)
 		if err == nil {
-			err = self.Login(conn)
+			conn, err = crypto.NewConn(conn, self.authToken)
+			if err != nil {
+				log.Error("crypto connection error:%s", err)
+				continue
+			}
+			err = self.auth(conn)
 			if err == nil {
-				manager := NewManager(conn, self, self.Config.ProxyConfigs)
+				manager := NewManager(self.clientId, conn, self.config)
 				manager.Run()
+				//manager exit
+				manager.Close()
 				tryCount = 0
-				log.Info("%s over", manager)
 				time.Sleep(time.Second)
 				continue
 			} else {
-				log.Warn("login fail:%s", err)
+				conn.Close()
+				log.Warn("auth failure:%s", err)
 			}
 		} else {
-			log.Warn("connect server fail:%s", err)
+			log.Warn("connect server failure, %s", err)
 		}
-		log.Info("try again after 6 second [%d/5]", tryCount)
-		time.Sleep(time.Second * 6)
+		log.Info("try again after 5 second [%d/5]", tryCount)
+		time.Sleep(time.Second * 5)
 	}
 }
 
-func (self *Client) connectServer() (net.Conn, error) {
-	conn, err := net.Dial("tcp", self.serverAddr)
-	if err != nil {
-		return nil, err
-	}
-	self.conn = conn
-	//todo:if not use yamux
-	//return conn, nil
-
-	cfg := yamux.DefaultConfig()
-	cfg.LogOutput = io.Discard
-	session, err := yamux.Client(conn, cfg)
-	if err != nil {
-		return nil, err
-	}
-	self.session = session
-	stream, err := session.OpenStream()
-	if err != nil {
-		return nil, err
-	}
-	return stream, nil
-}
-
-func (self *Client) NewPipeConn() (net.Conn, error) {
-	//todo: if not use yamux
-	log.Debug("create new pipe connect")
-	stream, err := self.session.OpenStream()
-	if err != nil {
-		return nil, err
-	}
-	msg := &message.PipeMessage{
-		ClientId: self.ClientId,
-	}
-	err = message.Send(msg, stream)
-	if err != nil {
-		log.Warn("Send pipe message fail:%s", err)
-		stream.Close()
-		return nil, err
-	}
-	return stream, nil
-}
-
-func (self *Client) Login(conn net.Conn) (err error) {
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
-
-	req := &message.LoginRequest{
-		Version:   1,
-		AuthCode:  self.Config.AuthCode,
-		PipeCount: self.Config.PipeCount,
-		HostName:  "",
+func (self *Client) auth(conn net.Conn) error {
+	hostname, _ := os.Hostname()
+	req := message.AuthRequest{
+		AuthToken: self.authToken,
+		HostName:  hostname,
 		Os:        os.Getenv("GOOS"),
 	}
-	err = message.Send(req, conn)
-	if err != nil {
-		return
+	if err := message.Send(req, conn); err != nil {
+		return err
 	}
-	conn.SetReadDeadline(time.Now().Add(time.Second * 5))
-	msg, err := message.Get(conn)
+
+	conn.SetReadDeadline(time.Now().Add(MessageReadTimeout))
+	msg, err := message.Read(conn)
 	if err != nil {
-		log.Warn("Get login result error:%s", err)
-		return
+		return err
 	}
 	conn.SetReadDeadline(time.Time{})
-	if resp, ok := msg.(*message.LoginResponse); !ok {
-		return errors.New("invalid login response")
+
+	if resp, ok := msg.(*message.AuthResponse); !ok {
+		return errors.New("invalid auth response")
 	} else if resp.Result != "ok" {
 		return errors.New(resp.Result)
 	} else {
-		self.ClientId = resp.ClientId
+		self.clientId = resp.ClientId
 	}
-	log.Info("login success")
+	log.Info("auth success")
 	return nil
 }

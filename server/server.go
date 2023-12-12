@@ -1,43 +1,45 @@
-package main
+package server
 
 import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/dev-shao/iprp/log"
-	"github.com/dev-shao/iprp/message"
-	"github.com/hashicorp/yamux"
-	"io"
+	"github.com/shaopson/forwarder/message"
+	"github.com/shaopson/forwarder/pipe/crypto"
+	log "github.com/shaopson/grlog"
 	"math/rand"
 	"net"
 	"sync"
 	"time"
 )
 
-type ServerConfig struct {
-	Ip       string `ini:"bind_ip"`
-	Port     string `ini:"bind_port"`
-	AuthCode string `ini:"auth_code"`
-	LogFile  string `ini:"log_file"`
+const MessageReadTimeout = time.Second * 5
+
+type Config struct {
+	Ip        string `ini:"bind_ip"`
+	Port      string `ini:"bind_port"`
+	AuthToken string `ini:"auth_token"`
+	LogFile   string `ini:"log_file"`
+	LogLevel  string `ini:"log_level"`
 }
 
 type Server struct {
-	config   *ServerConfig
-	address  string
-	listener net.Listener
-	managers map[string]*Manager
-	mutex    sync.RWMutex
-	mgrDone  chan *Manager
+	config      *Config
+	authToken   string
+	address     string
+	managers    map[string]*Manager
+	mutex       sync.RWMutex
+	mgrDoneChan chan *Manager
 }
 
-func NewServer(config *ServerConfig) *Server {
-	srv := &Server{
-		config:   config,
-		address:  net.JoinHostPort(config.Ip, config.Port),
-		managers: make(map[string]*Manager),
-		mgrDone:  make(chan *Manager, 1),
+func NewServer(cfg *Config) *Server {
+	return &Server{
+		config:      cfg,
+		address:     net.JoinHostPort(cfg.Ip, cfg.Port),
+		authToken:   cfg.AuthToken,
+		managers:    make(map[string]*Manager),
+		mgrDoneChan: make(chan *Manager, 1),
 	}
-	return srv
 }
 
 func (self *Server) Run() error {
@@ -45,128 +47,126 @@ func (self *Server) Run() error {
 	if err != nil {
 		return err
 	}
-	self.listener = listener
 	defer listener.Close()
-
-	log.Info("server listen on %s", self.address)
-	go self.awaitManagerDone()
-
+	log.Info("forwarder server listening on %s", self.address)
 	for {
-		conn, err := self.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Warn("listener close:%s", err)
+			log.Error("server close:%s", err)
 			return err
 		}
-		go self.Handle(conn)
+		log.Info("accept connection from %s", conn.RemoteAddr())
+		go self.handleConnect(conn)
 	}
 }
 
-func (self *Server) Handle(conn net.Conn) {
-	//todo: if not use yamux
+func (self *Server) handleConnect(conn net.Conn) {
 
-	cfg := yamux.DefaultConfig()
-	cfg.LogOutput = io.Discard
-	session, err := yamux.Server(conn, cfg)
+	conn, err := crypto.NewConn(conn, "forwarder")
 	if err != nil {
-		log.Warn("Create yamux session fail:%s", err)
+		log.Error("crypto connection error:%s", err)
+		conn.Close()
 		return
 	}
-	for {
-		stream, err := session.AcceptStream()
-		if err != nil {
-			log.Debug("yamux session close", err)
-			return
-		}
-		log.Debug("Accept new stream:%d", stream.StreamID())
-		go self.HandleStream(stream)
-	}
-}
 
-func (self *Server) HandleStream(stream *yamux.Stream) {
-	_ = stream.SetReadDeadline(time.Now().Add(time.Second * 5))
-	msg, err := message.Get(stream)
+	_ = conn.SetReadDeadline(time.Now().Add(MessageReadTimeout))
+	msg, err := message.Read(conn)
 	if err != nil {
-		log.Error("Get message from new stream fail:%s", err)
-		stream.Close()
+		log.Warn("read message failure from connection[%s]:%s", conn.RemoteAddr(), err)
+		conn.Close()
 		return
 	}
-	_ = stream.SetReadDeadline(time.Time{})
+	_ = conn.SetReadDeadline(time.Time{})
 
-	switch v := msg.(type) {
-	case *message.LoginRequest:
-		err := self.Login(v)
-		if err != nil {
-			resp := &message.LoginResponse{
-				Result: fmt.Sprintf("login fail:%s", err),
+	switch req := msg.(type) {
+	case *message.AuthRequest:
+		if err := self.auth(req); err != nil {
+			resp := &message.AuthResponse{
+				Result: err.Error(),
 			}
-			message.Send(resp, stream)
-			stream.Close()
+			message.Send(resp, conn)
+			conn.Close()
+			log.Info("client '%s' auth failure:%s, close connection", conn.RemoteAddr(), err)
 			return
 		}
-		log.Info("New client login; address:%s version:%s auth code:%s Os:%s", stream.RemoteAddr(), v.Version, v.AuthCode, v.Os)
-		mgr := self.RegisterManager(stream, v)
-		resp := &message.LoginResponse{
+		mgr := self.registerManager(req, conn)
+		log.Info("client '%s' auth success, client id:%s", conn.RemoteAddr(), mgr.ClientId)
+
+		resp := &message.AuthResponse{
 			ClientId: mgr.ClientId,
 			Result:   "ok",
 		}
-		message.Send(resp, stream)
-	case *message.PipeMessage:
+		message.Send(resp, conn)
+
+	case *message.ProxyRequest:
 		self.mutex.RLock()
-		mgr, ok := self.managers[v.ClientId]
-		self.mutex.RUnlock()
+		defer self.mutex.RUnlock()
+		mgr, ok := self.managers[req.ClientId]
 		if !ok {
-			stream.Close()
-		} else if err = mgr.PushPipeConn(stream); err != nil {
-			stream.Close()
+			resp := &message.ProxyResponse{
+				Result: fmt.Sprint("client not register"),
+			}
+			message.Send(resp, conn)
+			log.Warn("reject proxy request reason: unregister client %s", req.ClientId)
+			conn.Close()
+			return
 		}
-	default:
-		log.Warn("Unknown message from new stream:%d", stream.StreamID())
-		stream.Close()
+		resp := &message.ProxyResponse{
+			ProxyName: req.ProxyName,
+			Result:    "ok",
+		}
+		_, err := mgr.RegisterProxy(req, conn)
+		if err != nil {
+			resp.Result = err.Error()
+			message.Send(resp, conn)
+			conn.Close()
+			log.Warn("client '%s' register proxy error:%s", mgr.ClientId, resp.Result)
+			return
+		}
+		message.Send(resp, conn)
 	}
 }
 
-func (self *Server) Login(req *message.LoginRequest) error {
-	if self.config.AuthCode != req.AuthCode {
+func (self *Server) auth(msg *message.AuthRequest) error {
+	log.Info("auth {hostname:%s os:%s}", msg.HostName, msg.Os)
+	if msg.AuthToken != self.config.AuthToken {
 		return errors.New("auth code error")
 	}
-	//todo: compare version
-
+	//log
 	return nil
 }
 
-func (self *Server) RegisterManager(conn net.Conn, req *message.LoginRequest) *Manager {
-	manager := NewManager(self.genId(), conn, self.mgrDone, req)
-
-	go manager.Run()
+func (self *Server) registerManager(req *message.AuthRequest, conn net.Conn) *Manager {
+	mgr := NewManager(self.genKey(), conn, req)
 
 	self.mutex.Lock()
-	self.managers[manager.ClientId] = manager
-	self.mutex.Unlock()
+	defer self.mutex.Unlock()
+	self.managers[mgr.ClientId] = mgr
 
-	return manager
+	go func() {
+		mgr.Run()
+		mgr.Close()
+		self.deregisterManager(mgr.ClientId)
+	}()
+	return mgr
 }
 
-func (self *Server) genId() (key string) {
-	b := make([]byte, 16)
+func (self *Server) deregisterManager(clientId string) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	delete(self.managers, clientId)
+}
+
+func (self *Server) genKey() string {
+	buf := make([]byte, 16)
 	for {
-		rand.Read(b)
-		key = base64.RawURLEncoding.EncodeToString(b)[:16]
+		rand.Read(buf)
+		key := base64.RawURLEncoding.EncodeToString(buf)
 		self.mutex.RLock()
 		_, ok := self.managers[key]
 		self.mutex.RUnlock()
 		if !ok {
-			return
+			return key
 		}
-	}
-}
-
-func (self *Server) awaitManagerDone() {
-	for {
-		mgr := <-self.mgrDone
-		self.mutex.Lock()
-		delete(self.managers, mgr.ClientId)
-		self.mutex.Unlock()
-		mgr.Close()
-		log.Info("%s is done", mgr)
 	}
 }

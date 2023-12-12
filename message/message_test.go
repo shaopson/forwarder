@@ -5,49 +5,43 @@ import (
 	"testing"
 )
 
-var pipe []byte
-
-func TestSend(t *testing.T) {
-	buf := bytes.NewBuffer(nil)
-	req := LoginRequest{
-		Version:  1,
-		AuthCode: "12345",
-		HostName: "ling",
-		Os:       "macOs",
+func TestEncode(t *testing.T) {
+	m := &AuthRequest{
+		AuthToken: "auth",
+		HostName:  "localhost",
+		Os:        "linux",
 	}
-	resp := LoginResponse{
-		ClientId: "223",
-		Result:   "success",
-	}
-	err := Send(&req, buf)
+	data, err := encode(m)
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
-	err = Send(&resp, buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pipe = buf.Bytes()
-	if len(pipe) < 1 {
-		t.Error("buf write error")
-	}
+	t.Log(data)
 }
 
-func TestGet(t *testing.T) {
-	buf := bytes.NewReader(pipe)
-	msg, err := Get(buf)
-	if err != nil {
-		t.Fatal(err)
+func TestSend(t *testing.T) {
+	m := &AuthRequest{
+		AuthToken: "auth",
+		HostName:  "localhost",
+		Os:        "linux",
 	}
-	t.Log(msg)
-	req, ok := msg.(*LoginRequest)
-	if !ok {
-		t.Error("get message error")
+	writer := bytes.NewBuffer(make([]byte, 100))
+	if err := Send(m, writer); err != nil {
+		t.Error(err)
 	}
-	t.Log(req)
-	msg, err = Get(buf)
+	t.Log(writer.String())
+}
+
+func TestRead(t *testing.T) {
+	m := &AuthRequest{
+		AuthToken: "auth",
+		HostName:  "localhost",
+		Os:        "linux",
+	}
+	data, _ := encode(m)
+	buf := bytes.NewBuffer(data)
+	msg, err := Read(buf)
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
 	t.Log(msg)
 }

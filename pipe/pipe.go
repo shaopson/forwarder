@@ -7,13 +7,12 @@ import (
 
 func Join(left io.ReadWriteCloser, right io.ReadWriteCloser) (wn int64, rn int64, we error, re error) {
 	var wait sync.WaitGroup
-
-	pipe := func(to io.ReadWriteCloser, from io.ReadWriteCloser, written *int64, err *error) {
+	pipe := func(to io.ReadWriteCloser, from io.ReadWriteCloser, n *int64, err *error) {
 		defer to.Close()
 		defer from.Close()
 		defer wait.Done()
 		buf := make([]byte, 16*1024)
-		*written, *err = io.CopyBuffer(to, from, buf)
+		*n, *err = io.CopyBuffer(to, from, buf)
 	}
 	wait.Add(2)
 	go pipe(left, right, &wn, &we)
