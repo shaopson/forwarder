@@ -4,7 +4,7 @@ a reverse proxy, port forwarding tool. support tcp, udp proxy, stream encryption
 
 
 ## Usage
-
+download: [Release](https://github.com/shaopson/forwarder/releases/)
 ### Server side
 config file
 ```
