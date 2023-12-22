@@ -57,11 +57,12 @@ func main() {
 		}
 	}
 	if debug {
-		log.SetFlags(log.Fstd | log.Fshortfile)
+		log.SetFlags(log.FlagStd | log.FlagSFile)
 		log.SetLevel(log.LevelDebug)
 	}
 	if config.LogFile != "" {
-		file, err := log.NewRotatingFile(config.LogFile, logBackupFileCount, logFileSize, false)
+		file, err := log.NewRotateFile(config.LogFile, logBackupFileCount, logFileSize, true)
+		defer file.Close()
 		if err != nil {
 			fmt.Println("open log file error:", err)
 			os.Exit(1)

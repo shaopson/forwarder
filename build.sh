@@ -19,6 +19,15 @@ cp ../cmd/forwarder-server/forwarder.server.conf  $DEST
 cp ../cmd/forwarder-cli/forwarder.client.conf  $DEST
 tar -zcf forwarder_${VERSION}_${DEST}.tar.gz $DEST
 
+# linux ram64
+DEST=linux_arm64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o $DEST/forwarder-server ../cmd/forwarder-server/main.go
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o $DEST/forwarder-cli ../cmd/forwarder-cli/main.go
+cp ../cmd/forwarder-server/forwarder.server.conf  $DEST
+cp ../cmd/forwarder-cli/forwarder.client.conf  $DEST
+tar -zcf forwarder_${VERSION}_${DEST}.tar.gz $DEST
+
+
 # darwin  amd64
 DEST=darwin_amd64
 mkdir -p $DEST

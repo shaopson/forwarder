@@ -39,11 +39,12 @@ func main() {
 		os.Exit(0)
 	}
 	if debug {
-		log.SetFlags(log.Fstd | log.Fshortfile)
+		log.SetFlags(log.FlagStd | log.FlagSFile)
 		log.SetLevel(log.LevelDebug)
 	}
 	if config.LogFile != "" {
-		file, err := log.NewRotatingFile(config.LogFile, logBackupFileCount, logFileSize, false)
+		file, err := log.NewRotateFile(config.LogFile, logBackupFileCount, logFileSize, true)
+		defer file.Close()
 		if err != nil {
 			fmt.Println("set log file error:%s", err)
 			os.Exit(1)

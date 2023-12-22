@@ -62,7 +62,7 @@ func (self *Server) Run() error {
 
 func (self *Server) handleConnect(conn net.Conn) {
 
-	conn, err := crypto.NewConn(conn, "forwarder")
+	conn, err := crypto.NewConn(conn, self.authToken)
 	if err != nil {
 		log.Error("crypto connection error:%s", err)
 		conn.Close()
